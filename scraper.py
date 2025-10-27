@@ -18,5 +18,6 @@ def main():
         print("-", ingredient)
     print("\nInstructions:")
     print(scraper.instructions())
+    print(scraper.to_json())
 main()
 
