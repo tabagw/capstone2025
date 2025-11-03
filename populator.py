@@ -1,24 +1,16 @@
 """
-Simple recipe scraper - only gets title, time, ingredients, and instructions
+Recipe Database Populator
+Reads URLs from file and scrapes recipes into MySQL database
 """
 
 import mysql.connector
 from recipe_scrapers import scrape_me
-from recipe_scrapers import SCRAPERS
-SCRAPERS.keys()
+import time
+import random
+import json
 
 class RecipeDatabasePopulator:
     def __init__(self, db_config):
-        """
-        Initialize with MySQL database configuration
-        
-        db_config = {
-            'host': 'localhost',
-            'user': 'your_username',
-            'password': 'your_password',
-            'database': 'recipe_db'
-        }
-        """
         self.db_config = db_config
         self.conn = None
         self.cursor = None
@@ -36,11 +28,12 @@ class RecipeDatabasePopulator:
         if self.conn:
             self.conn.close()
         print("✓ Database connection closed")
-
-    def recipe_exists(self, url): 
-        """Check to see if recipe URL already exists"""
+    
+    def recipe_exists(self, url):
+        """Check if recipe URL already exists in database"""
         self.cursor.execute(
-            "SELECT recipe_id FROM recipes WHERE source_url = %s", (url,)
+            "SELECT recipe_id FROM recipes WHERE source_url = %s",
+            (url,)
         )
         return self.cursor.fetchone() is not None
     
@@ -66,11 +59,15 @@ class RecipeDatabasePopulator:
     def scrape_and_insert_recipe(self, url):
         """Scrape recipe from URL and insert into database"""
         try:
+            # Check if already exists
             if self.recipe_exists(url):
-                print(f" Recipe already exists")
+                print(f"⏭️  Recipe already exists, skipping")
                 return False
+            
+            print(f"\n📥 Scraping: {url}")
+            
             # Scrape the recipe
-            scraper = scrape_me(url, wild_mode = True)
+            scraper = scrape_me(url)
             
             # Get the data
             title = scraper.title()
@@ -78,102 +75,141 @@ class RecipeDatabasePopulator:
             ingredients = scraper.ingredients()
             instructions = scraper.instructions_list()
             
-            # Display what we found
-            print(f"\n📖 Recipe Found:")
-            print(f"   Title: {title}")
-            print(f"   Total Time: {total_time} minutes")
-            print(f"   Ingredients: {len(ingredients)} items")
-            print(f"   Instructions: {len(instructions)} steps")
+            # Validate we got meaningful data
+            if not title or not ingredients or not instructions:
+                print(f"  ⚠️  Incomplete recipe data, skipping")
+                return False
             
-            # Insert recipe (only title and time)
+            # Display what we found
+            print(f"   Title: {title}")
+            print(f"   Time: {total_time} min | Ingredients: {len(ingredients)} | Steps: {len(instructions)}")
+            
+            # Insert recipe
             self.cursor.execute("""
                 INSERT INTO recipes (name, total_time_minutes, source_url)
                 VALUES (%s, %s, %s)
             """, (title, total_time, url))
             
             recipe_id = self.cursor.lastrowid
-            print(f"\n  ✓ Inserted recipe (ID: {recipe_id})")
             
             # Insert ingredients
-            print(f"\n  📝 Ingredients:")
             for idx, ingredient_str in enumerate(ingredients, 1):
-                print(f"     {idx}. {ingredient_str}")
                 ingredient_id = self.get_or_create_ingredient(ingredient_str)
-                
                 self.cursor.execute("""
                     INSERT INTO recipe_ingredients (recipe_id, ingredient_id, order_index)
                     VALUES (%s, %s, %s)
                 """, (recipe_id, ingredient_id, idx))
             
-            print(f"  ✓ Inserted {len(ingredients)} ingredients")
-            
             # Insert instructions
-            print(f"\n  📋 Instructions:")
             for idx, instruction in enumerate(instructions, 1):
-                print(f"     Step {idx}: {instruction[:60]}...")
                 self.cursor.execute("""
                     INSERT INTO instructions (recipe_id, step_number, instruction_text)
                     VALUES (%s, %s, %s)
                 """, (recipe_id, idx, instruction))
             
-            print(f"  ✓ Inserted {len(instructions)} instruction steps")
-            
             # Commit transaction
             self.conn.commit()
-            print(f"\n  ✅ Successfully added recipe to database!")
+            print(f"  ✅ Successfully added recipe (ID: {recipe_id})")
             
             return True
             
         except Exception as e:
-            print(f"\n  ❌ Error: {str(e)}")
+            print(f"  ❌ Error: {str(e)}")
             self.conn.rollback()
             return False
 
-    def scrape_bulk_recipes(self, urls, target_count=200):
+    def bulk_scrape_recipes(self, urls, target_count=200):
+        """Scrape multiple recipes from a list of URLs"""
         successful = 0
         failed = 0
         skipped = 0
-
-        print(f" Target: {target_count} recipes")
+        
+        print(f"\n🎯 Target: {target_count} recipes")
+        print(f"📋 Processing {len(urls)} URLs\n")
+        print("=" * 80)
         
         for i, url in enumerate(urls, 1):
             if successful >= target_count:
-                print(f" \n Reached Target")
+                print(f"\n🎉 Reached target of {target_count} recipes!")
                 break
-
+            
+            print(f"\n[{i}/{len(urls)}] Progress: {successful} added, {failed} failed, {skipped} skipped")
+            
             result = self.scrape_and_insert_recipe(url)
-
+            
             if result:
                 successful += 1
             elif self.recipe_exists(url):
                 skipped += 1
-            else: 
+            else:
                 failed += 1
             
+            # Be polite to servers - add delay between requests
             if i < len(urls):
-                delay = random.uniform(2, 4)
+                delay = random.uniform(2, 5)
                 time.sleep(delay)
+        
+        print("\n" + "=" * 80)
+        print(f"\n📊 Final Statistics:")
+        print(f"   ✅ Successfully added: {successful}")
+        print(f"   ❌ Failed: {failed}")
+        print(f"   ⏭️  Skipped (duplicates): {skipped}")
+        print(f"   📈 Total processed: {successful + failed + skipped}")
+    
+    def load_urls_from_file(self, filename='recipe_urls.txt'):
+        """Load URLs from a text file"""
+        urls = []
+        try:
+            with open(filename, 'r') as f:
+                urls = [line.strip() for line in f if line.strip()]
+            print(f"✓ Loaded {len(urls)} URLs from {filename}")
+        except FileNotFoundError:
+            print(f"❌ File not found: {filename}")
+        return urls
+    
+    def load_urls_from_json(self, filename='recipe_urls.json'):
+        """Load URLs from a JSON file"""
+        try:
+            with open(filename, 'r') as f:
+                data = json.load(f)
+            urls = data.get('urls', [])
+            print(f"✓ Loaded {len(urls)} URLs from {filename}")
+            return urls
+        except FileNotFoundError:
+            print(f"❌ File not found: {filename}")
+            return []
 
-# TEST WITH SINGLE URL
+
 if __name__ == "__main__":
-    # Database configuration - UPDATE THESE!
+    print("=" * 80)
+    print("RECIPE DATABASE POPULATOR")
+    print("=" * 80)
+    
+    # Database configuration
     db_config = {
-        'host': 'cooking-captain-db.c650cuym2xic.us-east-1.rds.amazonaws.com',        # or your server IP/hostname
-        'user': 'admin',       # <- CHANGE THIS
-        'password': 'CookingCaptain2024!',   # <- CHANGE THIS
+        'host': 'cooking-captain-db.c650cuym2xic.us-east-1.rds.amazonaws.com',
+        'user': 'admin',
+        'password': 'CookingCaptain2024!',
         'database': 'recipe_db'
     }
     
-    # Single test URL
-    test_url = 'https://www.allrecipes.com/sheet-pan-teriyaki-glazed-pork-tenderloin-and-potatoes-recipe-11817889'
-    
-    # Initialize and run
+    # Initialize populator
     populator = RecipeDatabasePopulator(db_config)
     
+    # Load URLs from file (try JSON first, then fall back to TXT)
+    urls = populator.load_urls_from_json('recipe_urls.json')
+    if not urls:
+        urls = populator.load_urls_from_file('recipe_urls.txt')
+    
+    if not urls:
+        print("\n❌ No URLs found! Please run url_collector.py first.")
+        exit(1)
+    
+    # Connect and populate database
     try:
         populator.connect()
-        populator.scrape_and_insert_recipe(test_url)
+        populator.bulk_scrape_recipes(urls, target_count=200)
     finally:
         populator.close()
     
-    print("\n🎉 Done! Check your database to see the new recipe.")
+    print("\n🎉 All done! Check your database.")
