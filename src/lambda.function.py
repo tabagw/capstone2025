@@ -25,10 +25,7 @@ DB_CONFIG = {
 SHORT_STEP_THRESHOLD = 25
 
 
-# =============================================================================
-# DATABASE FUNCTIONS
-# =============================================================================
-
+# database 
 def get_db_connection() -> Optional[mysql.connector.MySQLConnection]:
     """
     Establish a connection to the MySQL database.
