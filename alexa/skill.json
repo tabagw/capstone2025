@@ -1,0 +1,38 @@
+{
+  "manifest": {
+    "publishingInformation": {
+      "locales": {
+        "en-US": {
+          "summary": "Find and cook recipes with step-by-step voice guidance",
+          "examplePhrases": [
+            "Alexa, open cooking captain",
+            "Alexa, ask cooking captain to find pasta",
+            "Alexa, ask cooking captain for chocolate cake"
+          ],
+          "name": "Cooking Captain",
+          "description": "Cooking Captain is your voice-activated kitchen assistant. Search for recipes by name or ingredient, then get step-by-step cooking instructions read aloud. Perfect for hands-free cooking!"
+        }
+      },
+      "isAvailableWorldwide": true,
+      "testingInstructions": "Open the skill and ask for a recipe by name.",
+      "category": "FOOD_AND_DRINK"
+    },
+    "apis": {
+      "custom": {
+        "endpoint": {
+          "uri": "arn:aws:lambda:us-east-1:940723107155:function:CookingCaptain"
+        },
+        "interfaces": []
+      }
+    },
+    "manifestVersion": "1.0",
+    "permissions": [],
+    "privacyAndCompliance": {
+      "allowsPurchases": false,
+      "isExportCompliant": true,
+      "containsAds": false,
+      "isChildDirected": false,
+      "usesPersonalInfo": false
+    }
+  }
+}

@@ -1,480 +1,817 @@
-# -*- coding: utf-8 -*-
+"""
+Cooking Captain - Alexa Skill Lambda Function
+"""
 
 import logging
-import json
-import os
-import urllib.request
-import pymysql
-import ask_sdk_core.utils as ask_utils
-from ask_sdk_core.skill_builder import SkillBuilder
-from ask_sdk_core.dispatch_components import AbstractRequestHandler, AbstractExceptionHandler
-from ask_sdk_core.handler_input import HandlerInput
-from ask_sdk_model import Response
-from recipe_scrapers import scrape_html
+from typing import Optional, Dict, List, Any, Tuple
 
-logger = logging.getLogger(__name__)
+import mysql.connector
+from mysql.connector import Error
+from difflib import get_close_matches
+
+# Configure logging for debugging
+logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Database Configuration
-DB_HOST = os.environ.get('DB_HOST')
-DB_USER = os.environ.get('DB_USER')
-DB_PASSWORD = os.environ.get('DB_PASSWORD')
-DB_NAME = os.environ.get('DB_NAME', 'recipe_db')
+# Database connection parameters for AWS RDS MySQL instance
+DB_CONFIG = {
+    'host': 'cooking-captain-db.c650cuym2xic.us-east-1.rds.amazonaws.com',
+    'user': 'admin',
+    'password': 'CookingCaptain2024!',
+    'database': 'recipe_db'
+}
 
-def get_db_connection():
-    """Create database connection"""
+# Threshold for considering a step as a "header" 
+SHORT_STEP_THRESHOLD = 25
+
+
+# =============================================================================
+# DATABASE FUNCTIONS
+# =============================================================================
+
+def get_db_connection() -> Optional[mysql.connector.MySQLConnection]:
+    """
+    Establish a connection to the MySQL database.
+    
+    Creates a new database connection using the configured credentials in order
+    to avoid connection pooling issues.
+    
+    Returns:
+        A MySQL connection object
+    """
     try:
-        connection = pymysql.connect(
-            host=DB_HOST,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            database=DB_NAME,
-            connect_timeout=5
-        )
+        connection = mysql.connector.connect(**DB_CONFIG)
         return connection
-    except Exception as e:
+    except Error as e:
         logger.error(f"Database connection failed: {e}")
         return None
 
-def init_database():
-    """Initialize database tables if they don't exist"""
-    connection = get_db_connection()
-    if not connection:
-        return False
-    
-    try:
-        with connection.cursor() as cursor:
-            # Create users table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id VARCHAR(255) PRIMARY KEY,
-                    email VARCHAR(255),
-                    name VARCHAR(255),
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # Create recipes table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS recipes (
-                    recipe_id INT AUTO_INCREMENT PRIMARY KEY,
-                    user_id VARCHAR(255),
-                    recipe_url TEXT NOT NULL,
-                    title VARCHAR(500),
-                    total_time INT,
-                    servings INT,
-                    ingredients TEXT,
-                    instructions TEXT,
-                    nutrients TEXT,
-                    image_url TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users(user_id)
-                )
-            """)
-            
-            connection.commit()
-            logger.info("Database initialized successfully")
-            return True
-    except Exception as e:
-        logger.error(f"Database initialization failed: {e}")
-        return False
-    finally:
-        connection.close()
 
-def create_or_get_user(user_id, email=None, name=None):
-    """Create or retrieve user from database"""
-    connection = get_db_connection()
-    if not connection:
-        return None
-    
-    try:
-        with connection.cursor() as cursor:
-            # Check if user exists
-            cursor.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
-            user = cursor.fetchone()
-            
-            if not user:
-                # Create new user
-                cursor.execute(
-                    "INSERT INTO users (user_id, email, name) VALUES (%s, %s, %s)",
-                    (user_id, email, name)
-                )
-                connection.commit()
-                logger.info(f"Created new user: {user_id}")
-            
-            return user_id
-    except Exception as e:
-        logger.error(f"Error managing user: {e}")
-        return None
-    finally:
-        connection.close()
+def search_recipes_fuzzy(recipe_name: str) -> List[Tuple[int, str, float]]:
+    """
+    Search for recipes matching the given name using progressive matching.
+    Implements a tiered search strategy:
+        1. Exact match (case-insensitive)
+        2. Partial match using SQL LIKE
+        3. Fuzzy match using difflib for close matches
 
-def save_recipe(user_id, recipe_url, scraper_data):
-    """Save scraped recipe to database"""
-    connection = get_db_connection()
-    if not connection:
-        return None
+    Args:
+        recipe_name: Recipe name
     
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute("""
-                INSERT INTO recipes 
-                (user_id, recipe_url, title, total_time, servings, ingredients, 
-                 instructions, nutrients, image_url)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                user_id,
-                recipe_url,
-                scraper_data.get('title'),
-                scraper_data.get('total_time'),
-                scraper_data.get('servings'),
-                json.dumps(scraper_data.get('ingredients', [])),
-                json.dumps(scraper_data.get('instructions', [])),
-                json.dumps(scraper_data.get('nutrients', {})),
-                scraper_data.get('image')
-            ))
-            connection.commit()
-            recipe_id = cursor.lastrowid
-            logger.info(f"Saved recipe {recipe_id} for user {user_id}")
-            return recipe_id
-    except Exception as e:
-        logger.error(f"Error saving recipe: {e}")
-        return None
-    finally:
-        connection.close()
-
-def get_user_recipes(user_id):
-    """Retrieve all recipes for a user"""
+    Returns:
+        A list of tuples containing recipe_id, recipe_name, confidence_score.
+        Returns empty list if no matches found or on database error.
+        Results are sorted by confidence (highest first).
+    """
     connection = get_db_connection()
     if not connection:
         return []
     
     try:
-        with connection.cursor(pymysql.cursors.DictCursor) as cursor:
-            cursor.execute(
-                "SELECT * FROM recipes WHERE user_id = %s ORDER BY created_at DESC",
-                (user_id,)
-            )
-            recipes = cursor.fetchall()
-            return recipes
-    except Exception as e:
-        logger.error(f"Error fetching recipes: {e}")
+        cursor = connection.cursor(dictionary=True)
+        
+
+
+        
+        # Tier 1: Exact match (case-insensitive)
+        cursor.execute(
+            "SELECT recipe_id, name FROM recipes WHERE LOWER(name) = LOWER(%s)",
+            (recipe_name,)
+        )
+        exact_match = cursor.fetchone()
+        
+        if exact_match:
+            logger.info(f"Exact match found: {exact_match['name']}")
+            cursor.close()
+            return [(exact_match['recipe_id'], exact_match['name'], 1.0)]
+
+
+
+        # Tier 2: Partial match using SQL LIKE
+        cursor.execute(
+            "SELECT recipe_id, name FROM recipes WHERE LOWER(name) LIKE LOWER(%s) LIMIT 5",
+            (f"%{recipe_name}%",)
+        )
+
+
+        partial_matches = cursor.fetchall()
+        
+        if partial_matches:
+            logger.info(f"Found {len(partial_matches)} partial matches")
+            if len(partial_matches) == 1:
+                cursor.close()
+                return [(partial_matches[0]['recipe_id'], partial_matches[0]['name'], 0.9)]
+            cursor.close()
+            return [(r['recipe_id'], r['name'], 0.8) for r in partial_matches]
+        
+        # Tier 3: Fuzzy matching using difflib
+        cursor.execute("SELECT recipe_id, name FROM recipes")
+        all_recipes = cursor.fetchall()
+        cursor.close()
+        
+        if not all_recipes:
+            return []
+        
+        recipe_dict = {r['name']: r['recipe_id'] for r in all_recipes}
+        recipe_names = list(recipe_dict.keys())
+        
+        matches = get_close_matches(recipe_name, recipe_names, n=3, cutoff=0.4)
+        
+        if matches:
+            if len(matches) == 1:
+                return [(recipe_dict[matches[0]], matches[0], 0.7)]
+            return [(recipe_dict[m], m, 0.6 - i * 0.1) for i, m in enumerate(matches)]
+        
+        return []
+        
+    except Error as e:
+        logger.error(f"Database error during recipe search: {e}")
         return []
     finally:
-        connection.close()
+        if connection and connection.is_connected():
+            connection.close()
+        # yay
 
-def scrape_recipe(url):
-    """Scrape recipe from URL"""
-    try:
-        with urllib.request.urlopen(url, timeout=10) as response:
-            html = response.read().decode("utf-8")
+
+def get_full_recipe(recipe_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Retrieve complete recipe details including ingredients and instructions.
+    
+    Fetches all information needed to guide a user through cooking a recipe:
+    metadata, ingredient list, and ordered cooking instructions.
+    
+    Args:
+        recipe_id: The database ID of the recipe to retrieve.
+    
+    Returns:
+        A dictionary containing:
+            - recipe_id (int): Database ID
+            - name (str): Recipe name
+            - total_time_minutes (int, optional): Estimated cooking time
+            - ingredients (List[str]): Formatted ingredient strings
+            - instructions (List[Dict]): Step dictionaries with
+              'step_number' and 'instruction_text'
         
-        scraper = scrape_html(html, org_url=url)
-        
-        # Extract data
-        recipe_data = {
-            'title': scraper.title(),
-            'total_time': scraper.total_time(),
-            'servings': scraper.yields(),
-            'ingredients': scraper.ingredients(),
-            'instructions': scraper.instructions_list(),
-            'nutrients': scraper.nutrients(),
-            'image': scraper.image() if hasattr(scraper, 'image') else None,
-            'url': url
-        }
-        
-        return recipe_data
-    except Exception as e:
-        logger.error(f"Error scraping recipe: {e}")
+        Returns None if recipe not found or on database error.
+    """
+    connection = get_db_connection()
+    if not connection:
+        logger.error("Failed to establish database connection")
         return None
+    
+    try:
+        cursor = connection.cursor(dictionary=True)
+        
+        # Fetch recipee
+        cursor.execute("SELECT * FROM recipes WHERE recipe_id = %s", (recipe_id,))
+        recipe = cursor.fetchone()
+        
 
-# Initialize database on cold start
-init_database()
-
-
-class LaunchRequestHandler(AbstractRequestHandler):
-    """Handler for Skill Launch"""
-    def can_handle(self, handler_input):
-        return ask_utils.is_request_type("LaunchRequest")(handler_input)
-
-    def handle(self, handler_input):
-        user_id = handler_input.request_envelope.session.user.user_id
-        create_or_get_user(user_id)
-        
-        speak_output = """Welcome to Cooking Captain! You can ask me to save a recipe 
-        by saying 'save recipe' followed by the URL, or ask about your saved recipes. 
-        What would you like to do?"""
-        
-        return (
-            handler_input.response_builder
-                .speak(speak_output)
-                .ask("What would you like to do?")
-                .response
-        )
-
-
-class AddRecipeIntentHandler(AbstractRequestHandler):
-    """Handler for adding a new recipe"""
-    def can_handle(self, handler_input):
-        return ask_utils.is_intent_name("AddRecipeIntent")(handler_input)
-
-    def handle(self, handler_input):
-        user_id = handler_input.request_envelope.session.user.user_id
-        
-        # Get recipe URL from slot
-        slots = handler_input.request_envelope.request.intent.slots
-        recipe_url = slots.get("RecipeURL")
-        
-        if not recipe_url or not recipe_url.value:
-            speak_output = "I didn't catch the recipe URL. Please say 'save recipe' followed by the full URL."
-            return (
-                handler_input.response_builder
-                    .speak(speak_output)
-                    .ask(speak_output)
-                    .response
-            )
-        
-        url = recipe_url.value
-        
-        # Scrape the recipe
-        recipe_data = scrape_recipe(url)
-        
-        if not recipe_data:
-            speak_output = f"Sorry, I couldn't scrape the recipe from that URL. Please make sure it's a valid recipe website."
-            return (
-                handler_input.response_builder
-                    .speak(speak_output)
-                    .ask("Would you like to try another recipe?")
-                    .response
-            )
-        
-        # Save to database
-        recipe_id = save_recipe(user_id, url, recipe_data)
-        
-        if recipe_id:
-            speak_output = f"Great! I've saved {recipe_data['title']} to your collection. You can ask me about ingredients, instructions, or cooking time."
-        else:
-            speak_output = "I scraped the recipe but had trouble saving it. Please try again."
-        
-        # Store current recipe in session
-        session_attr = handler_input.attributes_manager.session_attributes
-        session_attr['current_recipe'] = recipe_data
-        
-        return (
-            handler_input.response_builder
-                .speak(speak_output)
-                .ask("What would you like to know about this recipe?")
-                .response
-        )
-
-
-class ListRecipesIntentHandler(AbstractRequestHandler):
-    """Handler for listing user's recipes"""
-    def can_handle(self, handler_input):
-        return ask_utils.is_intent_name("ListRecipesIntent")(handler_input)
-
-    def handle(self, handler_input):
-        user_id = handler_input.request_envelope.session.user.user_id
-        recipes = get_user_recipes(user_id)
-        
-        if not recipes:
-            speak_output = "You don't have any saved recipes yet. Say 'save recipe' followed by a URL to add one!"
-        else:
-            recipe_titles = [recipe['title'] for recipe in recipes[:5]]
-            speak_output = f"You have {len(recipes)} saved recipes. Here are your most recent: {', '.join(recipe_titles)}"
-        
-        return (
-            handler_input.response_builder
-                .speak(speak_output)
-                .ask("Would you like to hear details about any of these recipes?")
-                .response
-        )
-
-
-class GetIngredientsIntentHandler(AbstractRequestHandler):
-    """Handler for getting ingredients"""
-    def can_handle(self, handler_input):
-        return ask_utils.is_intent_name("GetIngredientsIntent")(handler_input)
-
-    def handle(self, handler_input):
-        session_attr = handler_input.attributes_manager.session_attributes
-        recipe = session_attr.get('current_recipe')
-        
         if not recipe:
-            speak_output = "I don't have a recipe loaded. Please add a recipe first by saying 'save recipe' followed by the URL."
-        else:
-            ingredients = recipe.get('ingredients', [])
-            speak_output = f"Here are the ingredients for {recipe['title']}: {', '.join(ingredients[:10])}"
+            logger.error(f"Recipe not found with ID: {recipe_id}")
+            cursor.close()
+            return None
+        
+
+
+
+
+        logger.info(f"Retrieved recipe: {recipe['name']}")
+        
+        # Fetch ingredients
+
+        cursor.execute("""
+            SELECT i.name
+            FROM recipe_ingredients ri
+            JOIN ingredients i ON ri.ingredient_id = i.ingredient_id
+            WHERE ri.recipe_id = %s
+            ORDER BY ri.order_index
+        """, (recipe_id,))
+
+
+        ingredients_raw = cursor.fetchall()
+        recipe['ingredients'] = [ing['name'] for ing in ingredients_raw]
+        logger.info(f"Found {len(recipe['ingredients'])} ingredients")
+        
+        # Fetch cooking instructions
+        
+        cursor.execute("""
+            SELECT step_number, instruction_text
+            FROM instructions
+            WHERE recipe_id = %s
+            ORDER BY step_number
+        """, (recipe_id,))
+
+
+        recipe['instructions'] = cursor.fetchall()
+        logger.info(f"Found {len(recipe['instructions'])} instruction steps")
+        
+        cursor.close()
+
+        return recipe
+        
+    except Error as e:
+        logger.error(f"Database error while fetching recipe: {e}")
+        return None
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+
+
+def get_random_recipes(count: int = 3) -> List[str]:
+    """
+    Retrieve random recipe names for user suggestions.
+    
+    Args:
+        count: Number of random recipes to retrieve. Defaults to 3.
+    
+    Returns:
+        A list of recipe name strings. 
+        Empty list when failure.
+    """
+    connection = get_db_connection()
+    if not connection:
+        return []
+    
+    try:
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute("SELECT name FROM recipes ORDER BY RAND() LIMIT %s", (count,))
+        recipes = cursor.fetchall()
+        cursor.close()
+        return [r['name'] for r in recipes]
+    except Error as e:
+        logger.error(f"Error fetching random recipes: {e}")
+        return []
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+
+# Instructions PROCESSING
+
+def combine_short_steps(instructions: List[str]) -> List[str]:
+    """
+    Combine short header steps with their following detailed instructions.
+
+    Args:
+        instructions: List of instruction strings in order.
+    
+    Returns:
+        New list with headers combined: "Header: Detailed instruction."
+    
+    Example:
+        Input:  ["Preheat", "Preheat oven to 400°F."]
+        Output: ["Preheat: Preheat oven to 400°F."]
+    """
+    if not instructions:
+        return instructions
+    
+    combined = []
+    i = 0
+    
+    while i < len(instructions):
+        current_step = instructions[i].strip()
+        
+        # Check
+        is_short_header = (
+            len(current_step) < SHORT_STEP_THRESHOLD 
+            and '.' not in current_step
+        )
+        
+        if is_short_header and i + 1 < len(instructions):
+            next_step = instructions[i + 1].strip()
             
-            if len(ingredients) > 10:
-                speak_output += f" and {len(ingredients) - 10} more."
-        
-        return (
-            handler_input.response_builder
-                .speak(speak_output)
-                .ask("What else would you like to know?")
-                .response
-        )
-
-
-class GetInstructionsIntentHandler(AbstractRequestHandler):
-    """Handler for getting cooking instructions"""
-    def can_handle(self, handler_input):
-        return ask_utils.is_intent_name("GetInstructionsIntent")(handler_input)
-
-    def handle(self, handler_input):
-        session_attr = handler_input.attributes_manager.session_attributes
-        recipe = session_attr.get('current_recipe')
-        
-        if not recipe:
-            speak_output = "I don't have a recipe loaded. Please add a recipe first."
-        else:
-            instructions = recipe.get('instructions', [])
-            if isinstance(instructions, list):
-                speak_output = f"Here are the instructions for {recipe['title']}: " + " ".join(instructions[:3])
+            if len(next_step) > len(current_step):
+                combined.append(f"{current_step}: {next_step}")
+                i += 2  # Skip
             else:
-                speak_output = f"Here are the instructions: {instructions[:500]}"
-        
-        return (
-            handler_input.response_builder
-                .speak(speak_output)
-                .ask("Would you like to hear more?")
-                .response
-        )
+                combined.append(current_step)
+                i += 1
+        else:
+            combined.append(current_step)
+            i += 1
+    
+    return combined
 
+# intent handlers
 
-class HelpIntentHandler(AbstractRequestHandler):
-    """Handler for Help Intent"""
-    def can_handle(self, handler_input):
-        return ask_utils.is_intent_name("AMAZON.HelpIntent")(handler_input)
-
-    def handle(self, handler_input):
-        speak_output = """You can save recipes by saying 'save recipe' followed by the URL. 
-        You can also ask to list your recipes, get ingredients, or get cooking instructions."""
-        
-        return (
-            handler_input.response_builder
-                .speak(speak_output)
-                .ask(speak_output)
-                .response
-        )
-
-
-class CancelOrStopIntentHandler(AbstractRequestHandler):
-    """Handler for Cancel and Stop Intent"""
-    def can_handle(self, handler_input):
-        return (ask_utils.is_intent_name("AMAZON.CancelIntent")(handler_input) or
-                ask_utils.is_intent_name("AMAZON.StopIntent")(handler_input))
-
-    def handle(self, handler_input):
-        speak_output = "Happy cooking!"
-        return handler_input.response_builder.speak(speak_output).response
-
-
-class SessionEndedRequestHandler(AbstractRequestHandler):
-    """Handler for Session End"""
-    def can_handle(self, handler_input):
-        return ask_utils.is_request_type("SessionEndedRequest")(handler_input)
-
-    def handle(self, handler_input):
-        return handler_input.response_builder.response
-
-
-class CatchAllExceptionHandler(AbstractExceptionHandler):
-    """Generic error handling"""
-    def can_handle(self, handler_input, exception):
-        return True
-
-    def handle(self, handler_input, exception):
-        logger.error(exception, exc_info=True)
-        speak_output = "Sorry, I had trouble doing what you asked. Please try again."
-        
-        return (
-            handler_input.response_builder
-                .speak(speak_output)
-                .ask(speak_output)
-                .response
-        )
-
-
-# Build skill
-sb = SkillBuilder()
-
-sb.add_request_handler(LaunchRequestHandler())
-sb.add_request_handler(AddRecipeIntentHandler())
-sb.add_request_handler(ListRecipesIntentHandler())
-sb.add_request_handler(GetIngredientsIntentHandler())
-sb.add_request_handler(GetInstructionsIntentHandler())
-sb.add_request_handler(HelpIntentHandler())
-sb.add_request_handler(CancelOrStopIntentHandler())
-sb.add_request_handler(SessionEndedRequestHandler())
-
-sb.add_exception_handler(CatchAllExceptionHandler())
-
-lambda_handler = sb.lambda_handler()
-
-
-# API Gateway handler for direct API calls (testing with Postman)
-def api_handler(event, context):
+def handle_find_recipe(event: Dict, session_attributes: Dict) -> Dict:
     """
-    Handle direct API calls for testing with Postman
+    Handle FindRecipeIntent when user asks to find a recipe.
+    
+    Flow:
+        1. User: "Find chocolate cake"
+        2. Search database for matches
+        3. Single match: Present details, ask to proceed
+        4. Multiple matches: List options, ask user to choose
+        5. No matches: Apologize, suggest alternatives
+    
+    Args:
+        event: request with intent and slots.
+        session_attributes: Current session state to update.
+    
+    Returns:
+        response with speech and updated session.
+    
+    Session Changes (on single match):
+        - conversation_state: 'confirm_recipe'
+        - pending_recipe_id, pending_recipe_name
+        - recipe_ingredients, recipe_instructions, total_steps
     """
-    try:
-        body = json.loads(event.get('body', '{}'))
-        action = body.get('action')
+
+    slots = event['request']['intent'].get('slots', {})
+    recipe_slot = slots.get('RecipeName', {})
+    recipe_name = recipe_slot.get('value', '').strip()
+    
+    logger.info(f"FindRecipeIntent: '{recipe_name}'")
+    
+    if not recipe_name:
+        return build_response(
+            "Sorry, I didn't catch the recipe name. What recipe would you like to find?",
+            session_attributes=session_attributes
+        )
+    
+    matches = search_recipes_fuzzy(recipe_name)
+    
+    # No matches
+    if not matches:
+        suggestions = get_random_recipes(2)
+
+
+        suggest_text = f" You might like {suggestions[0]} or {suggestions[1]}." if suggestions else ""
+        return build_response(
+            f"Sorry, I couldn't find a recipe for {recipe_name}.{suggest_text}",
+            session_attributes=session_attributes
+        )
+    
+    
+    # Single high-confidence match
+    if len(matches) == 1 or matches[0][2] >= 0.9:
+        recipe_id, name, confidence = matches[0]
+        logger.info(f"Match: {name} (ID: {recipe_id}, conf: {confidence})")
         
-        if action == 'scrape_recipe':
-            url = body.get('url')
-            recipe_data = scrape_recipe(url)
-            return {
-                'statusCode': 200,
-                'body': json.dumps(recipe_data),
-                'headers': {'Content-Type': 'application/json'}
-            }
+
+
+        recipe = get_full_recipe(recipe_id)
         
-        elif action == 'save_recipe':
-            user_id = body.get('user_id')
-            url = body.get('url')
-            recipe_data = scrape_recipe(url)
-            if recipe_data:
-                recipe_id = save_recipe(user_id, url, recipe_data)
-                return {
-                    'statusCode': 200,
-                    'body': json.dumps({'recipe_id': recipe_id, 'data': recipe_data}),
-                    'headers': {'Content-Type': 'application/json'}
+
+
+        if recipe:
+            session_attributes['pending_recipe_id'] = recipe_id
+            session_attributes['pending_recipe_name'] = name
+            session_attributes['conversation_state'] = 'confirm_recipe'
+            session_attributes['recipe_ingredients'] = recipe.get('ingredients', [])
+            session_attributes['recipe_instructions'] = [
+                inst['instruction_text'] for inst in recipe.get('instructions', [])
+            ]
+            session_attributes['total_steps'] = len(recipe.get('instructions', []))
+            
+
+
+            time_text = ""
+            if recipe.get('total_time_minutes'):
+                time_text = f"It takes about {recipe['total_time_minutes']} minutes. "
+            
+            ing_count = len(recipe.get('ingredients', []))
+
+
+            step_count = len(recipe.get('instructions', [])) 
+            
+
+
+            speak_text = (
+                f"I found {name}. {time_text}"
+                f"It has {ing_count} ingredients and {step_count} steps. "
+                "Would you like to hear the ingredients and instructions?"
+            )
+
+
+            return build_response(speak_text, session_attributes=session_attributes)
+        else:
+            logger.error(f"Failed to load recipe ID: {recipe_id}")
+            return build_response(
+                f"I found {name} but couldn't load the details. Please try again.",
+                session_attributes=session_attributes
+            )
+    
+    # Multiple matches
+
+    names = [match[1] for match in matches[:3]]
+
+    options_text = ", ".join(names[:-1]) + f", or {names[-1]}"
+    
+    session_attributes['recipe_matches'] = [{'id': m[0], 'name': m[1]} for m in matches[:3]]
+    session_attributes['conversation_state'] = 'choose_recipe'
+
+    
+    return build_response(
+        f"I found a few recipes. Did you mean {options_text}?",
+        session_attributes=session_attributes
+    )
+
+
+
+def handle_yes_intent(event: Dict, session_attributes: Dict) -> Dict:
+    """
+    Handle AMAZON.YesIntent for affirmative responses.
+    
+    Args:
+        event: Alexa request event.
+        session_attributes: Session state with recipe data.
+    
+    Returns:
+        Alexa response appropriate to current state.
+    """
+
+
+    state = session_attributes.get('conversation_state')
+    logger.info(f"YesIntent in state: {state}")
+    
+
+    if state == 'confirm_recipe':
+        recipe_name = session_attributes.get('pending_recipe_name', 'this recipe')
+        ingredients = session_attributes.get('recipe_ingredients', [])
+        
+        # if needed Reload
+
+
+        if not ingredients:
+            recipe_id = session_attributes.get('pending_recipe_id')
+            if recipe_id:
+                recipe = get_full_recipe(recipe_id)
+                if recipe:
+                    ingredients = recipe.get('ingredients', [])
+                    session_attributes['recipe_ingredients'] = ingredients
+                    session_attributes['recipe_instructions'] = [
+                        inst['instruction_text'] for inst in recipe.get('instructions', [])
+                    ]
+                    session_attributes['total_steps'] = len(recipe.get('instructions', []))
+
+
+
+        
+        if ingredients:
+            ing_text = "Here are the ingredients: "
+            for ing in ingredients[:5]:
+                ing_text += f"{ing}, "
+            if len(ingredients) > 5:
+                ing_text += f"and {len(ingredients) - 5} more. "
+            else:
+                ing_text = ing_text.rstrip(", ") + ". "
+
+
+
+            ing_text += "Would you like to start the step-by-step instructions?"
+        
+            session_attributes['current_recipe_id'] = session_attributes.get('pending_recipe_id')
+            session_attributes['current_recipe_name'] = recipe_name
+            session_attributes['conversation_state'] = 'confirm_instructions'
+            session_attributes['current_step'] = 0
+            
+            return build_response(ing_text, session_attributes=session_attributes)
+        else:
+            return build_response(
+                "I'm having trouble loading the ingredients. Please try finding the recipe again.",
+                session_attributes={}
+            ) 
+        
+    
+    elif state == 'confirm_instructions':
+        instructions = session_attributes.get('recipe_instructions', [])
+        
+        if instructions:
+            # Combine short headers
+            combined_instructions = combine_short_steps(instructions)
+            session_attributes['recipe_instructions'] = combined_instructions
+            
+
+            total = len(combined_instructions)
+            speak_text = (
+                f"Let's start cooking! Step 1 of {total}: {combined_instructions[0]} "
+                "Say 'next' for the next step, or 'repeat' to hear this again."
+            )
+            
+
+
+            session_attributes['current_step'] = 1
+            session_attributes['total_steps'] = total
+            session_attributes['conversation_state'] = 'cooking'
+            
+
+
+            return build_response(speak_text, session_attributes=session_attributes)
+        else:
+            return build_response(
+                "I couldn't find the instructions. Please try finding the recipe again.",
+                session_attributes={}
+            )
+        
+
+    
+    return build_response(
+        "I'm not sure what you're confirming. Try asking for a recipe by name.",
+        session_attributes=session_attributes
+    )
+
+
+
+
+def handle_no_intent(event: Dict, session_attributes: Dict) -> Dict:
+    """
+    Handle AMAZON.NoIntent when user declines current option.
+    
+    Args:
+        event: Alexa request event.
+        session_attributes: Session state (will be cleared).
+    
+    Returns:
+        Alexa response offering alternatives.
+    """
+    suggestions = get_random_recipes(2)
+    suggest_text = f" You might like {suggestions[0]} or {suggestions[1]}." if suggestions else ""
+    
+    return build_response(
+        f"No problem! What other recipe would you like to find?{suggest_text}",
+        session_attributes={}
+    )
+
+
+
+def handle_next_step(session_attributes: Dict) -> Dict:
+    """
+    Handle navigation to next cooking instruction step.
+    
+    Args:
+        session_attributes: Session state with step tracking.
+    
+    Returns:
+        Alexa response with next instruction or completion message.
+    
+    Requires:
+        conversation_state == 'cooking'
+    """
+    logger.info(f"NextIntent, state: {session_attributes.get('conversation_state')}")
+    
+    if session_attributes.get('conversation_state') != 'cooking':
+        return build_response(
+            "You're not currently cooking a recipe. "
+            "Try finding a recipe first by saying 'find' and the recipe name.",
+            session_attributes=session_attributes
+        )
+    
+    current_step = session_attributes.get('current_step', 0)
+    total_steps = session_attributes.get('total_steps', 0)
+    instructions = session_attributes.get('recipe_instructions', [])
+    
+    next_step = current_step + 1
+    
+    if next_step > total_steps or next_step > len(instructions):
+        recipe_name = session_attributes.get('current_recipe_name', 'the recipe')
+        return build_response(
+            f"That's the last step! You've completed {recipe_name}. Enjoy your meal!",
+            session_attributes={},
+            should_end=True
+        )
+    
+    session_attributes['current_step'] = next_step
+    speak_text = (
+        f"Step {next_step} of {total_steps}: {instructions[next_step - 1]} "
+        "Say 'next' to continue, or 'repeat' to hear this again."
+    )
+    
+    return build_response(speak_text, session_attributes=session_attributes)
+
+
+
+
+def handle_repeat_step(session_attributes: Dict) -> Dict:
+    """
+    Handle request to repeat current cooking instruction.
+    
+    
+    Args:
+        session_attributes: Session state with step tracking.
+    
+    Returns:
+        Alexa response with current instruction repeated.
+    
+    Requires:
+        conversation_state == 'cooking'
+    """
+    logger.info(f"RepeatIntent, state: {session_attributes.get('conversation_state')}")
+    
+    if session_attributes.get('conversation_state') != 'cooking':
+        return build_response(
+            "You're not currently cooking a recipe. Try finding a recipe first.",
+            session_attributes=session_attributes
+        )
+    
+    current_step = session_attributes.get('current_step', 1)
+    total_steps = session_attributes.get('total_steps', 0)
+    instructions = session_attributes.get('recipe_instructions', [])
+    
+    if 0 < current_step <= len(instructions):
+        speak_text = (
+            f"Step {current_step} of {total_steps}: {instructions[current_step - 1]} "
+            "Say 'next' to continue."
+        )
+        return build_response(speak_text, session_attributes=session_attributes)
+    
+    return build_response(
+        "I couldn't find that step. Please try finding the recipe again.",
+        session_attributes={}
+    )
+
+
+
+
+def handle_previous_step(session_attributes: Dict) -> Dict:
+    """
+    Handle navigation to previous cooking instruction step.
+    
+    Moves back one step. If already at step 1, informs user.
+    
+    Args:
+        session_attributes: Session state with step tracking.
+    
+    Returns:
+        Alexa response with previous instruction.
+    
+    Requires:
+        conversation_state == 'cooking'
+    """
+    logger.info(f"PreviousIntent, state: {session_attributes.get('conversation_state')}")
+    
+    if session_attributes.get('conversation_state') != 'cooking':
+        return build_response(
+            "You're not currently cooking a recipe. Try finding a recipe first.",
+            session_attributes=session_attributes
+        )
+    
+    current_step = session_attributes.get('current_step', 1)
+    total_steps = session_attributes.get('total_steps', 0)
+    instructions = session_attributes.get('recipe_instructions', [])
+    
+    if current_step <= 1:
+        speak_text = (
+            f"You're already at step 1: {instructions[0]} "
+            "Say 'next' to continue."
+        )
+        return build_response(speak_text, session_attributes=session_attributes)
+    
+
+
+    prev_step = current_step - 1
+    session_attributes['current_step'] = prev_step
+    
+
+
+    speak_text = (
+        f"Going back. Step {prev_step} of {total_steps}: {instructions[prev_step - 1]} "
+        "Say 'next' to continue."
+    )
+    
+    return build_response(speak_text, session_attributes=session_attributes)
+
+
+
+
+def handle_help(session_attributes: Dict) -> Dict:
+    """
+    Handle AMAZON.HelpIntent to provide usage guidance.
+    
+    Args:
+        session_attributes: Session state (preserved).
+    
+    Returns:
+        Alexa response with help information.
+    """
+
+
+    suggestions = get_random_recipes(2)
+    suggest_text = f" For example, try 'find {suggestions[0]}'." if suggestions else ""
+    
+
+    help_text = (
+        "I can help you find and cook recipes! "
+        "Ask for a recipe by name, like 'find chocolate cake'. "
+        "When cooking, say 'next' for the next step, 'repeat' to hear it again, "
+        "or 'previous' to go back."
+        f"{suggest_text}"
+    )
+    
+    return build_response(help_text, session_attributes=session_attributes)
+
+def build_response(
+    speech_text: str,
+    session_attributes: Optional[Dict] = None,
+    should_end: bool = False
+) -> Dict:
+    """
+    Builds a properly formatted Alexa skill response.
+    """
+    if session_attributes is None:
+        session_attributes = {}
+    
+    return {
+        "version": "1.0",
+        "sessionAttributes": session_attributes,
+        "response": {
+            "outputSpeech": {
+                "type": "PlainText",
+                "text": speech_text
+            },
+            "shouldEndSession": should_end,
+            "reprompt": {
+                "outputSpeech": {
+                    "type": "PlainText",
+                    "text": "What would you like to do? Say 'next' for the next step, or ask for another recipe."
                 }
-        
-        elif action == 'get_recipes':
-            user_id = body.get('user_id')
-            recipes = get_user_recipes(user_id)
-            return {
-                'statusCode': 200,
-                'body': json.dumps(recipes, default=str),
-                'headers': {'Content-Type': 'application/json'}
             }
+        }
+    }
+
+def lambda_handler(event: Dict, context: Any) -> Dict:
+    """
+    Main entry point for AWS Lambda function.
+    
+    Invoked by Alexa for every user interaction. Routes requests
+    to appropriate handlers based on request type and intent.
+    """
+    request_type = event['request']['type']
+    session_attributes = event.get('session', {}).get('attributes', {}) or {}
+    
+
+
+    logger.info(f"Request: {request_type}, State: {session_attributes.get('conversation_state', 'none')}")
+    
+    # Skill launch
+    if request_type == "LaunchRequest":
+        suggestions = get_random_recipes(3)
+        suggest_text = ""
+        if suggestions:
+            suggest_text = f" Try asking for {suggestions[0]}, {suggestions[1]}, or {suggestions[2]}."
         
-        elif action == 'create_user':
-            user_id = body.get('user_id')
-            email = body.get('email')
-            name = body.get('name')
-            create_or_get_user(user_id, email, name)
-            return {
-                'statusCode': 200,
-                'body': json.dumps({'message': 'User created', 'user_id': user_id}),
-                'headers': {'Content-Type': 'application/json'}
-            }
+
+        welcome_text = (
+            "Welcome to Cooking Captain! I can help you find recipes from my database. "
+            "Ask for a recipe by name, or search by ingredient."
+            f"{suggest_text}"
+        )
+        return build_response(welcome_text, session_attributes=session_attributes)
+
+
+
+    # Intent request
+    elif request_type == "IntentRequest":
+        intent_name = event['request']['intent']['name']
+        logger.info(f"Intent: {intent_name}")
+        
+        if intent_name == "FindRecipeIntent":
+            return handle_find_recipe(event, session_attributes)
+        
+        elif intent_name == "AMAZON.YesIntent":
+            return handle_yes_intent(event, session_attributes)
+        
+        elif intent_name == "AMAZON.NoIntent":
+            return handle_no_intent(event, session_attributes)
+        
+        elif intent_name in ["NextIntent", "AMAZON.NextIntent"]:
+            return handle_next_step(session_attributes)
+        
+        elif intent_name in ["RepeatIntent", "AMAZON.RepeatIntent"]:
+            return handle_repeat_step(session_attributes)
+        
+        elif intent_name in ["PreviousIntent", "AMAZON.PreviousIntent"]:
+            return handle_previous_step(session_attributes)
+        
+        elif intent_name == "AMAZON.HelpIntent":
+            return handle_help(session_attributes)
+        
+        elif intent_name in ["AMAZON.CancelIntent", "AMAZON.StopIntent"]:
+            return build_response("Happy cooking! Goodbye!", should_end=True)
+        
+        elif intent_name == "AMAZON.FallbackIntent":
+            if session_attributes.get('conversation_state') == 'cooking':
+                return build_response(
+                    "I didn't catch that. Say 'next' for the next step, "
+                    "'repeat' to hear it again, or 'stop' to end.",
+                    session_attributes=session_attributes
+                )
+            return build_response(
+                "I'm not sure about that. Try asking for a recipe by name, like 'find pasta'.",
+                session_attributes=session_attributes
+            )
         
         else:
-            return {
-                'statusCode': 400,
-                'body': json.dumps({'error': 'Invalid action'}),
-                'headers': {'Content-Type': 'application/json'}
-            }
+            logger.warning(f"Unhandled intent: {intent_name}")
+            return build_response(
+                "I didn't understand that. Try asking for a recipe by name.",
+                session_attributes=session_attributes
+            )
     
-    except Exception as e:
-        logger.error(f"API Error: {e}")
-        return {
-            'statusCode': 500,
-            'body': json.dumps({'error': str(e)}),
-            'headers': {'Content-Type': 'application/json'}
-        }
+    # Session ended or other
+    else:
+        return build_response("Goodbye!", should_end=True)
+
+
+__all__ = ['lambda_handler']

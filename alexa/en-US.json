@@ -1,0 +1,150 @@
+{
+  "interactionModel": {
+    "languageModel": {
+      "invocationName": "cooking captain",
+      "intents": [
+        {
+          "name": "AMAZON.CancelIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.HelpIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.StopIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.NavigateHomeIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.FallbackIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.YesIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.NoIntent",
+          "samples": []
+        },
+        {
+          "name": "FindRecipeIntent",
+          "slots": [
+            {
+              "name": "RecipeName",
+              "type": "AMAZON.Food"
+            }
+          ],
+          "samples": [
+            "find {RecipeName}",
+            "find a recipe for {RecipeName}",
+            "find recipe for {RecipeName}",
+            "search for {RecipeName}",
+            "look up {RecipeName}",
+            "get {RecipeName}",
+            "get recipe for {RecipeName}",
+            "get me {RecipeName}",
+            "get me a recipe for {RecipeName}",
+            "how do I make {RecipeName}",
+            "how to make {RecipeName}",
+            "I want {RecipeName}",
+            "I want to make {RecipeName}",
+            "I would like {RecipeName}",
+            "show me {RecipeName}",
+            "tell me about {RecipeName}",
+            "can you find {RecipeName}",
+            "do you have {RecipeName}",
+            "recipe for {RecipeName}",
+            "{RecipeName} recipe",
+            "{RecipeName}",
+            "try {RecipeName}",
+            "make {RecipeName}",
+            "cook {RecipeName}"
+          ]
+        },
+        {
+          "name": "NextIntent",
+          "slots": [],
+          "samples": [
+            "next",
+            "next step",
+            "next one",
+            "go to the next step",
+            "continue",
+            "keep going",
+            "go on",
+            "what's next",
+            "whats next",
+            "move on",
+            "proceed",
+            "and then",
+            "then what",
+            "what do I do next",
+            "what comes next",
+            "the next step",
+            "give me the next step",
+            "tell me the next step",
+            "go ahead",
+            "onwards",
+            "following step"
+          ]
+        },
+        {
+          "name": "RepeatIntent",
+          "slots": [],
+          "samples": [
+            "repeat",
+            "repeat that",
+            "say that again",
+            "what was that",
+            "again",
+            "one more time",
+            "repeat the step",
+            "say it again",
+            "can you repeat that",
+            "what did you say",
+            "pardon",
+            "come again",
+            "repeat please",
+            "tell me again",
+            "read that again"
+          ]
+        },
+        {
+          "name": "PreviousIntent",
+          "slots": [],
+          "samples": [
+            "previous",
+            "previous step",
+            "go back",
+            "back",
+            "last step",
+            "the step before",
+            "before that",
+            "go to the previous step",
+            "take me back",
+            "back up",
+            "the one before"
+          ]
+        },
+        {
+          "name": "ListIngredientsIntent",
+          "slots": [],
+          "samples": [
+            "list ingredients",
+            "what are the ingredients",
+            "tell me the ingredients",
+            "ingredients",
+            "read the ingredients",
+            "what do I need"
+          ]
+        }
+      ],
+      "types": []
+    }
+  }
+}
